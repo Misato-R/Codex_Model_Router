@@ -1,0 +1,7 @@
+# Copy to .codex/config.toml and replace cwd with your local clone's absolute path.
+# Use forward slashes on Windows, or escape backslashes in TOML strings.
+[mcp_servers.jev_model_router]
+command = "node"
+args = ["--import", "tsx", "src/mcp-server.ts"]
+cwd = "C:/Projects/Codex_Model_Router"
+env_vars = ["TYPESAFE_API_KEY"]

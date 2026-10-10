@@ -1,0 +1,8 @@
+node_modules/
+.router-memory/
+*.log
+.env
+.env.*
+!.env.example
+.codex/
+/test.txt
