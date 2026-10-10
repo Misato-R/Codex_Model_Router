@@ -198,6 +198,16 @@ Windows MCP 环境兼容：如果 Codex 宿主没有把变量传给 Router 子�
 - `economy`：通常选 cheap，复杂任务最高到 standard。
 - `quality`：普通任务选 standard，复杂任务选 hard。
 
+当采纳 Jev 的分类结果时，路由模式会按下表调整最终交给 Codex 执行的档位：
+
+| 路由模式 | Jev 判断 cheap | Jev 判断 standard | Jev 判断 hard |
+| --- | --- | --- | --- |
+| `economy` 节省优先 | cheap | standard | 降为 standard |
+| `balanced` 平衡 | cheap | standard | hard |
+| `quality` 质量优先 | 升为 standard | standard | hard |
+
+表中的结果是最终执行档位，再按模型映射确定 Codex 的模型与推理强度。Jev 置信度低于 0.5 时，仍回退到本地规则。
+
 ## 执行与认证
 
 - CLI adapter 是默认执行器，通过本机 Codex CLI 运行 `codex exec`，传入 `-C` 项目目录、`-s workspace-write`、实际 `-m` 模型及 reasoning effort。
