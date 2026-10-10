@@ -1,6 +1,6 @@
 # Jev Model Router
 
-The `npm run chat` App Server client performs routing before starting each turn in the same thread. When its developer instructions say routing has already happened, execute the task directly; do not call the MCP router or invoke the router through shell commands. The MCP guidance below applies to ordinary Codex host sessions, not this direct chat client.
+The `npm run chat` App Server client and `npm run cli` native CLI proxy perform routing before starting each turn in the same thread. When their developer instructions say routing has already happened, execute the task directly; do not call the MCP router or invoke the router through shell commands. The MCP guidance below applies to ordinary Codex host sessions, not these direct clients.
 
 When the user asks Codex to perform a task in this workspace, use the `jev_model_router.jev_route_and_run` MCP tool to classify it with Jev and execute it with the selected Codex model. Pass the user's complete task and this workspace's absolute path. Keep `sandboxMode` as `read-only` unless the user asks Codex to change files; use `workspace-write` only for those requested changes.
 
