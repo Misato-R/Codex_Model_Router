@@ -1,3 +1,4 @@
+import { timingWriter } from "./turn-timing.js";
 import { appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { startDesktopHost } from "./desktop-host.js";
@@ -20,7 +21,8 @@ try {
   const host = startDesktopHost({ project, executable, args: process.argv.slice(2), env: process.env, input: process.stdin, output: process.stdout,
     manual: router === "manual",
     manageThread: (p) => !p.remote && !p.remoteUrl && typeof p.cwd === "string" && resolve(p.cwd).toLowerCase() === resolve(project).toLowerCase(),
-    route: (task, context, signal) => router === "jev" ? routeTaskWithJev(task, mode, { models, context, signal }) : Promise.resolve(routeTask(task, mode, { models })),
+    timing: timingWriter(),
+    route: (task, context, signal, onRequestTiming) => router === "jev" ? routeTaskWithJev(task, mode, { models, context, signal, onRequestTiming }) : Promise.resolve(routeTask(task, mode, { models })),
     metadata,
   });
   process.once("SIGINT", () => { void host.close(130); }); process.once("SIGTERM", () => { void host.close(143); });

@@ -1,3 +1,4 @@
+import { timingWriter } from "./turn-timing.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, realpath, stat } from "node:fs/promises";
@@ -50,8 +51,9 @@ Active turn/steer and active turn/start pass through unchanged. No new UI or sla
   const logPath = join(logDir, `routes-${Date.now()}-${process.pid}.jsonl`);
   let writes = Promise.resolve();
   const host = await startHost({ project, executable: runtime.executable, env: runtime.env, token, port, manual: values.manual,
-    route: (task, context, signal) => values.router === "jev"
-      ? routeTaskWithJev(task, values.mode as Mode, { ...options, context, signal })
+    timing: timingWriter(),
+    route: (task, context, signal, onRequestTiming) => values.router === "jev"
+      ? routeTaskWithJev(task, values.mode as Mode, { ...options, context, signal, onRequestTiming })
       : Promise.resolve(routeTask(task, values.mode as Mode, options)),
     metadata: (entry) => { writes = writes.then(() => appendFile(logPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 })); void writes.catch(() => host.close()); },
   });

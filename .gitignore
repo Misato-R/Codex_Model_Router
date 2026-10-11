@@ -6,3 +6,5 @@ node_modules/
 !.env.example
 .codex/
 /test.txt
+/test/log/
+/test/.recording-*.active

@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { TurnTiming } from "./turn-timing.js";
 import type { Route } from "./types.js";
 import type { ModelInfo } from "./chat-session.js";
 
@@ -5,7 +7,7 @@ import type { ModelInfo } from "./chat-session.js";
 export type Message = { id?: string | number; method?: string; params?: Record<string, any>; result?: any; error?: any; [key: string]: any };
 type Id = string | number;
 type Pending = { original?: Id; method: string; params: Record<string, any>; managed?: boolean; resolve?: (value: any) => void; reject?: (error: Error) => void; timer?: NodeJS.Timeout };
-type Turn = { phase: "routing" | "starting" | "active"; controller: AbortController; id?: string };
+type Turn = { phase: "routing" | "starting" | "active"; controller: AbortController; id?: string; timing?: TurnTiming; timingTurnId?: string; earlyCompletion?: { id: string; status: string; at: number } };
 // Native CLI and desktop use different labels for a new user submission.
 // Keep automation, retries and tool continuations on their existing settings.
 const USER_TURN_TRIGGERS = new Set([
@@ -20,7 +22,8 @@ export interface ProxyOptions {
   controlTimeoutMs?: number;
   classificationTimeoutMs?: number;
   manageThread?(params: Record<string, any>): boolean;
-  route(task: string, context: string, signal: AbortSignal): Promise<Route>;
+  route(task: string, context: string, signal: AbortSignal, onJevTiming: (ms: number) => void): Promise<Route>;
+  timing?(record: Record<string, unknown>): void;
   toBackend(message: Message): void;
   toClient(message: Message): void;
   fatal(): void;
@@ -71,6 +74,7 @@ export class CliProxy {
     const thread = String(p.threadId ?? "");
     const active = this.turns.get(thread);
     if (message.method === "turn/interrupt" && active?.phase === "routing") {
+      active.timing?.finish("cancelled-before-submit");
       active.controller.abort();
       this.turns.delete(thread);
       this.reply(message.id!, {}); // Cancels only the proxy's not-yet-submitted work.
@@ -109,7 +113,7 @@ export class CliProxy {
         reason: active ? "active-turn" : p.toolOutput ? "tool-output" : "non-user-trigger" });
       this.forward(message); return;
     }
-    const state: Turn = { phase: "routing", controller: new AbortController() };
+    const state: Turn = { phase: "routing", controller: new AbortController(), timing: this.options.timing ? new TurnTiming(thread, this.options.timing) : undefined };
     this.turns.set(thread, state);
     const task = (Array.isArray(p.input) ? p.input : []).filter((item: any) => item.type === "text").map((item: any) => item.text).join("\n");
     const signal = AbortSignal.any([state.controller.signal, AbortSignal.timeout(this.options.classificationTimeoutMs ?? 25_000)]);
@@ -119,7 +123,8 @@ export class CliProxy {
       let params = p;
       if (!this.options.manual) {
         const context = (this.recent.get(thread) ?? []).map((text, i) => `${i + 1}. ${text}`).join("\n");
-        const route = await this.abortable(this.options.route(task || "[Non-text user input]", context, signal), signal);
+        const route = await this.abortable(this.options.route(task || "[Non-text user input]", context, signal, ms => state.timing?.jevRequest(ms)), signal);
+        state.timing?.selected(route);
         const model = this.models.find((entry) => entry.model === route.model);
         if (!model?.supportedReasoningEfforts.some((entry) => entry.reasoningEffort === route.effort)) throw new Error("Unavailable model/effort");
         params = { ...p, model: route.model, effort: route.effort };
@@ -132,10 +137,12 @@ export class CliProxy {
       }
       signal.throwIfAborted();
       if (this.closed || this.turns.get(thread) !== state) return;
+      state.timing?.submit(params.model, params.effort);
       state.phase = "starting";
       this.forward({ ...message, params });
       if (task) this.recent.set(thread, [...(this.recent.get(thread) ?? []), task.slice(0, 500)].slice(-3));
     } catch {
+      state.timing?.finish(signal.aborted ? "cancelled-or-routing-timeout" : "routing-failed");
       if (this.turns.get(thread) === state) this.turns.delete(thread);
       this.error(message.id!, signal.aborted ? "Turn cancelled or classification timed out; not submitted." : "Routing/preflight failed; turn not submitted. Check ChatGPT login, model mapping and Jev availability.");
     }
@@ -215,10 +222,13 @@ export class CliProxy {
       }
       if (message.method === "turn/completed" && turnId) {
         this.options.metadata?.({ event: "turn-completed", threadId: p.threadId, turnId, status: p.turn.status });
+        if (state && (state.id ?? state.timingTurnId) === turnId) state.timing?.finish(p.turn.status, turnId);
+        else if (state?.phase === "starting" && !state.id) state.earlyCompletion = { id: turnId, status: p.turn.status, at: performance.now() };
         this.completed.add(`${p.threadId}:${turnId}`);
         if (this.completed.size > 1024) this.completed.delete(this.completed.values().next().value!);
         if (state?.id === turnId || (state?.phase === "active" && !state.id)) this.turns.delete(p.threadId);
       }
+      if (message.method === "turn/started" && turnId && state?.timing && state.phase === "starting" && !state.timingTurnId) state.timingTurnId = turnId;
       if (message.method === "turn/started" && turnId && !state && !this.completed.has(`${p.threadId}:${turnId}`)) {
         this.turns.set(p.threadId, { phase: "active", id: turnId, controller: new AbortController() });
       }
@@ -253,6 +263,9 @@ export class CliProxy {
         turnId: message.result?.turn?.id, model: pending.params.model, effort: pending.params.effort });
       if (state?.phase === "starting") {
         const turn = message.result?.turn;
+        if (message.error || !turn) state.timing?.finish("submission-rejected");
+        else if (state.earlyCompletion && state.earlyCompletion.id === turn.id) state.timing?.finish(state.earlyCompletion.status, turn.id, state.earlyCompletion.at);
+        else if (turn.status !== "inProgress") state.timing?.finish(turn.status, turn.id);
         if (message.error || !turn || turn.status !== "inProgress" || this.completed.has(`${thread}:${turn.id}`)) this.turns.delete(thread);
         else { state.id = turn.id; state.phase = "active"; }
       }
@@ -275,7 +288,7 @@ export class CliProxy {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const turn of this.turns.values()) turn.controller.abort();
+    for (const turn of this.turns.values()) { turn.timing?.finish("disconnected-outcome-unknown", turn.id); turn.controller.abort(); }
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject?.(new Error("Disconnected")); }
     this.pending.clear(); this.turns.clear(); this.recent.clear(); this.serverIds.clear(); this.serverReverse.clear();
   }

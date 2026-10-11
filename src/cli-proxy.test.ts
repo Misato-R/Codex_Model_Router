@@ -18,6 +18,43 @@ test("stdio JSON survives chunking, embedded Unicode line separators and multi-l
 
 const route: Route = { model: "available", effort: "low", tier: "cheap", source: "rules", reason: "test" };
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("timing correlates a routed turn, excludes stale completion, and emits once", async () => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record), route: async (_task, _context, _signal, onJevTiming) => {
+    onJevTiming(2.5); return { ...route, source: "jev" };
+  } });
+  h.start(); await tick(); h.ack(0, "measured");
+  h.complete("stale"); assert.equal(records.length, 0);
+  h.complete("measured"); h.complete("measured"); h.proxy.close();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].turnId, "measured");
+  assert.equal(records[0].durationsMs.jevRequest, 2.5);
+  assert.equal(records[0].model, "available");
+  const d = records[0].durationsMs;
+  assert.ok(Math.abs(d.total - d.routing - d.codex) < 0.003);
+  assert.ok(!JSON.stringify(records).includes("question"));
+});
+
+test("timing retains an early completion until its turn/start response correlates it", async () => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record) });
+  h.start(); await tick(); h.complete("early"); h.ack(0, "early"); h.proxy.close();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, "completed");
+  assert.equal(records[0].turnId, "early");
+  assert.equal(records[0].durationsMs.jevRequest, null);
+});
+
+test("timing records routing failure without inventing Codex execution", async () => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record), route: async () => { throw new Error("offline"); } });
+  h.start(); await tick(); h.proxy.close();
+  assert.equal(h.submitted().length, 0);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, "routing-failed");
+  assert.equal(records[0].durationsMs.codex, null);
+});
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {}) {
   const backend: Message[] = [], client: Message[] = [], metadata: Record<string, unknown>[] = [];

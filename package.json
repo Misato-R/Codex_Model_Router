@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "record:timing": "tsx test/record-timing.ts",
+    "test:timing": "tsx --test src/turn-timing.test.ts src/cli-proxy.test.ts",
     "dev": "tsx src/main.ts",
     "chat": "tsx src/chat.ts",
     "test": "tsx --test src/router.test.ts src/chat.test.ts src/cli-proxy.test.ts src/cli-host.test.ts",

@@ -23,7 +23,7 @@ export async function stopChild(child: ChildProcess, ownsProcessGroup = false): 
   });
 }
 
-export interface HostOptions extends Pick<ProxyOptions, "project" | "manual" | "route" | "metadata" | "controlTimeoutMs" | "classificationTimeoutMs"> {
+export interface HostOptions extends Pick<ProxyOptions, "project" | "manual" | "route" | "metadata" | "timing" | "controlTimeoutMs" | "classificationTimeoutMs"> {
   executable: string;
   env: NodeJS.ProcessEnv;
   token: string;
