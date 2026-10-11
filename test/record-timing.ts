@@ -21,7 +21,7 @@ const stop = () => rmSync(marker, { force: true });
 process.once("exit", stop);
 process.once("SIGTERM", () => { stop(); process.exit(0); });
 process.on("SIGINT", () => { if (target === "desktop") { stop(); process.exit(0); } });
-console.log(`计时记录已启用，JSON 保存到：${log}`);
+console.log(`耗时与 Codex Token 用量记录已启用，JSON 保存到：${log}`);
 const child = spawn(process.execPath, ["--import", pathToFileURL(join(root, "node_modules", "tsx", "dist", "loader.mjs")).href,
   join(root, "src", `${target}.ts`), ...args.slice(1)], {
   cwd: root, stdio: "inherit", shell: false,

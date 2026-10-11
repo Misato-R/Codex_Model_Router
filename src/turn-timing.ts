@@ -2,6 +2,7 @@ import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tokenCounts, turnUsage, type TokenCounts } from "./turn-usage.js";
 
 export class TurnTiming {
   readonly requestId = randomUUID();
@@ -11,8 +12,36 @@ export class TurnTiming {
   private jev: number | null = null;
   private finished = false;
   private selection: Record<string, unknown> = {};
+  private baseline: TokenCounts | null = null;
+  private total: TokenCounts | null = null;
+  private last: TokenCounts | null = null;
+  private record?: Record<string, unknown>;
   constructor(private threadId: string, private emit: (record: Record<string, unknown>) => void) {}
+  get isFinished(): boolean { return this.finished; }
   jevRequest(ms: number): void { this.jev = ms; }
+  usageBaseline(total: TokenCounts | null): void { this.baseline = total; }
+  advanceUsageBaseline(total: TokenCounts): void {
+    const previous = this.baseline?.totalTokens;
+    if (previous !== null && previous !== undefined && (total.totalTokens === null || total.totalTokens < previous)) return;
+    this.baseline = total;
+    if (this.record) {
+      this.record = { ...this.record, tokenUsage: turnUsage(this.baseline, this.total, this.last) };
+      this.emit(this.record);
+    }
+  }
+  usageUpdate(value: { total?: unknown; last?: unknown }): void {
+    const total = tokenCounts(value.total);
+    if (!total) return;
+    // Ignore duplicate or regressive snapshots for this same turn.
+    if (this.total?.totalTokens !== null && this.total?.totalTokens !== undefined && total.totalTokens !== null && total.totalTokens < this.total.totalTokens) return;
+    this.total = total;
+    this.last = tokenCounts(value.last);
+    // Usage can arrive after completion. Rewrite the same JSON without changing timings.
+    if (this.record) {
+      this.record = { ...this.record, tokenUsage: turnUsage(this.baseline, this.total, this.last) };
+      this.emit(this.record);
+    }
+  }
   selected(route: { model: string; effort: string; tier: string; source?: string }): void {
     this.selection = { model: route.model, effort: route.effort, tier: route.tier, source: route.source };
   }
@@ -24,14 +53,15 @@ export class TurnTiming {
     if (this.finished) return;
     this.finished = true;
     const rounded = (ms: number) => Math.round(ms * 1000) / 1000;
-    this.emit({ schemaVersion: 1, requestId: this.requestId, threadId: this.threadId,
+    this.record = { schemaVersion: 2, requestId: this.requestId, threadId: this.threadId,
       turnId: turnId ?? null, startedAt: this.startedAt, finishedAt: new Date().toISOString(),
       status, ...this.selection, durationsMs: {
         jevRequest: this.jev === null ? null : rounded(this.jev),
         routing: this.submitted === undefined ? null : rounded(this.submitted - this.start),
         codex: this.submitted === undefined ? null : rounded(end - this.submitted),
         total: rounded(end - this.start),
-      } });
+      }, tokenUsage: turnUsage(this.baseline, this.total, this.last) };
+    this.emit(this.record);
   }
 }
 

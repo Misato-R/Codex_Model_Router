@@ -8,9 +8,17 @@ Jev Router 会先判断任务适合哪个模型档位，再让 Codex 使用该�
 | standard | `gpt-6.1-sol` | medium |
 | hard | `gpt-6-astra` | high |
 
+## Windows 可视化启动器
+
+双击项目根目录的 **`Start-Router.cmd`**，即可在窗口中选择项目文件夹、CLI / 桌面 / 简易聊天入口、Jev / 本地规则 / 手动选择，以及路由模式，再点击“启动 Router”。首次使用可点击“安装依赖”和“登录 Codex”。
+
+启动器还支持临时输入 Jev Key、恢复会话 ID，以及记录每轮耗时与 Token 用量到 `test/log`。临时输入的 Key 仅供本次启动使用，不保存到文件。桌面入口请先完全退出已有桌面应用；CLI 和简易聊天会打开交互终端。勾选记录时，需保持记录窗口打开。
+
+简易聊天可在启动器中选择只读或允许修改项目；CLI / 桌面的权限在原版界面中调整。桌面入口的旧会话也在应用内选择。关闭启动器不会自动关闭已启动的会话；请在对应入口中退出。
+
 ## 开始之前
 
-- 安装 Node.js 和 Codex CLI，并完成 `codex login`。Codex 登录负责执行任务。
+- 安装 Node.js 和 Codex CLI，并通过启动器的“登录 Codex”或 `codex login` 完成登录。Codex 登录负责执行任务。
 - 在线路由还需要 TypeSafe API Key，变量名为 `TYPESAFE_API_KEY`。它只供 Jev 分类使用，与 Codex 登录分开。
 - 把本仓库下载到本机，在 Router 项目目录安装依赖：
 

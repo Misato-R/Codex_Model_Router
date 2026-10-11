@@ -56,6 +56,55 @@ test("timing records routing failure without inventing Codex execution", async (
   assert.equal(records[0].durationsMs.codex, null);
 });
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+function usage(h: ReturnType<typeof harness>, id: string, total: number) {
+  const counts = { totalTokens: total, inputTokens: total * 0.8, cachedInputTokens: total * 0.2,
+    outputTokens: total * 0.2, reasoningOutputTokens: total * 0.1 };
+  h.proxy.backend({ method: "thread/tokenUsage/updated", params: { threadId: "same", turnId: id,
+    tokenUsage: { total: counts, last: { ...counts, totalTokens: 10 }, modelContextWindow: null } } });
+}
+
+test("per-question usage spans multiple responses without adding duplicate snapshots", async () => {
+  const records: any[] = []; const h = harness({ timing: r => records.push(r) });
+  usage(h, "previous", 100);
+  h.start(); await tick(); h.ack(); usage(h, "turn", 120); usage(h, "turn", 150); usage(h, "turn", 150); h.complete();
+  assert.deepEqual(records.at(-1).tokenUsage.counts, { totalTokens: 50, inputTokens: 40, cachedInputTokens: 10,
+    cacheWriteInputTokens: null, outputTokens: 10, reasoningOutputTokens: 5 });
+  assert.equal(records.at(-1).tokenUsage.lastModelResponse.totalTokens, 10);
+  h.proxy.close();
+});
+
+test("late usage rewrites the completed turn and preserves its timing", async () => {
+  const records: any[] = []; const h = harness({ timing: r => records.push(r) });
+  usage(h, "previous", 100); h.start(); await tick(); h.ack(); h.complete();
+  const original = records.at(-1); usage(h, "turn", 160);
+  assert.equal(records.at(-1).requestId, original.requestId);
+  assert.deepEqual(records.at(-1).durationsMs, original.durationsMs);
+  assert.equal(records.at(-1).tokenUsage.counts.totalTokens, 60); h.proxy.close();
+});
+
+test("late final usage from a previous question corrects the next baseline", async () => {
+  const records: any[] = []; const h = harness({ timing: r => records.push(r) });
+  usage(h, "history", 100); h.start(); await tick(); h.ack(0, "first"); usage(h, "first", 180); h.complete("first");
+  h.start(2); await tick(); h.ack(1, "second"); usage(h, "second", 250); h.complete("second");
+  usage(h, "first", 200); usage(h, "first", 180);
+  const second = records.filter(r => r.turnId === "second").at(-1);
+  assert.equal(second.tokenUsage.counts.totalTokens, 50); h.proxy.close();
+});
+
+test("missing resumed-thread baseline and reset counters are not reported as zero", async () => {
+  const records: any[] = []; const h = harness({ timing: r => records.push(r) });
+  h.start(); await tick(); h.ack(); usage(h, "turn", 1000); h.complete();
+  assert.equal(records.at(-1).tokenUsage.availability, "baseline-unavailable");
+  assert.equal(records.at(-1).tokenUsage.counts, null);
+  h.start(2); await tick(); h.ack(1, "reset"); usage(h, "reset", 100); h.complete("reset");
+  assert.equal(records.at(-1).tokenUsage.availability, "counter-reset"); h.proxy.close();
+});
+
+test("usage arriving before turn/start acknowledgement is attributed by returned turn ID", async () => {
+  const records: any[] = []; const h = harness({ timing: r => records.push(r) });
+  usage(h, "previous", 100); h.start(); await tick(); usage(h, "early", 180); h.complete("early"); h.ack(0, "early");
+  assert.equal(records.at(-1).tokenUsage.counts.totalTokens, 80); h.proxy.close();
+});
 function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {}) {
   const backend: Message[] = [], client: Message[] = [], metadata: Record<string, unknown>[] = [];
   const classifications: { task: string; context: string; signal: AbortSignal }[] = [];
