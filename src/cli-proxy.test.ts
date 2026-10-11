@@ -80,6 +80,54 @@ test("native collaboration mask uses routed settings without losing Plan instruc
   assert.equal(h.submitted()[1].params?.model, "native-background");
 });
 
+test("desktop user triggers route before submission and preserve the same thread and collaboration mode", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  const triggers = [undefined, null, "user", "composer", "composer_queue", "composer_queue_run_now", "page_composer", "edit_user_message", "chatgpt_handoff"];
+  for (const [i, turnTrigger] of triggers.entries()) {
+    h.start(i + 1, { turnTrigger, model: null, effort: null,
+      collaborationMode: { mode: "default", settings: { model: "native", reasoning_effort: "xhigh", developer_instructions: "preserve" } },
+    });
+    await tick();
+    const params = h.submitted()[i].params!;
+    assert.equal(params.threadId, "same");
+    assert.equal(params.turnTrigger, turnTrigger);
+    assert.equal(params.model, "available");
+    assert.equal(params.effort, "low");
+    assert.deepEqual(params.collaborationMode, { mode: "default", settings: { model: "available", reasoning_effort: "low", developer_instructions: "preserve" } });
+    h.ack(i, `desktop-${i}`); h.complete(`desktop-${i}`);
+  }
+  assert.equal(h.classifications.length, triggers.length);
+  assert.equal(h.metadata.filter(m => m.event === "route-selected").length, triggers.length);
+});
+
+test("desktop background triggers stay unchanged and bypass metadata contains only the reason", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  const triggers = ["automation_cron_scheduled", "automation_heartbeat_scheduled", "safety_buffer_retry", "environment_setup_retry", "send_user_message_async_question", "unknown-sensitive-sentinel"];
+  for (const [i, turnTrigger] of triggers.entries()) {
+    h.start(i + 1, { turnTrigger, threadId: `background-${i}`, model: "native", effort: "high" });
+    await tick();
+    assert.equal(h.submitted()[i].params?.model, "native");
+    assert.equal(h.submitted()[i].params?.effort, "high");
+    assert.equal(h.submitted()[i].params?.turnTrigger, turnTrigger);
+  }
+  assert.equal(h.classifications.length, 0);
+  assert.equal(h.metadata.filter(m => m.event === "turn-bypassed" && m.reason === "non-user-trigger").length, triggers.length);
+  assert.equal(JSON.stringify(h.metadata).includes("unknown-sensitive-sentinel"), false);
+});
+
+test("desktop composer input added to an active turn and tool continuations do not reroute", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  h.start(1, { turnTrigger: "composer" }); await tick(); h.ack();
+  h.start(2, { turnTrigger: "composer", model: "native" }); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.equal(h.submitted()[1].params?.model, "native");
+  assert.ok(h.metadata.some(m => m.event === "turn-bypassed" && m.reason === "active-turn"));
+  h.complete();
+  h.start(3, { turnTrigger: "composer", model: "native", toolOutput: { type: "fixture" } }); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.ok(h.metadata.some(m => m.event === "turn-bypassed" && m.reason === "tool-output"));
+});
+
 test("approvals, unknown requests, responses and notifications pass while routing waits; ids cannot collide", async (t) => {
   const gate = deferred<Route>(); const h = harness({ route: () => gate.promise }); t.after(() => h.proxy.close());
   h.start(); await tick();

@@ -219,3 +219,52 @@ Windows MCP 环境兼容：如果 Codex 宿主没有把变量传给 Router 子�
 ## 扩展点
 
 `TaskExecutor` 是 CLI 与 SDK 共用接口；`AgentRuntime` / `RuntimeExecutor` 保留 LangChain/LangGraph 扩展接口，路由与执行分离。单次执行入口的 Jev 只接收 `--task` 和模式，聊天入口额外传入有限近期问题片段；Jev 不自动读取源码。单次执行入口使用文件摘要记忆；新 `npm run chat` 入口通过 App Server 恢复 Codex 会话。`ChatSession` 使用可替换的 `RpcConnection`，分类与会话执行独立。
+
+## Windows 桌面 stdio 实验版
+
+保留安装版桌面界面，通过仅作用于新进程的环境变量，把本地 app-server stdio 接入现有 RPC 核心。不会修改全局配置、注册表或应用安装文件；默认使用原有 profile，不复制或重置会话。**适用于桌面中的本地 Codex 项目会话，不接管普通 ChatGPT 云端聊天。** 依赖安装版内部的 `CODEX_CLI_PATH` 接入点，属于随版本变化的实验集成。
+
+```powershell
+npm run desktop -- --check
+npm run desktop -- --prepare
+# 完全退出当前桌面（包括托盘），在普通终端执行：
+npm run desktop -- --project "输入目标项目路径" --router jev
+npm run desktop -- --router rules
+npm run desktop -- --manual
+# 可选独立的桌面配置目录（不会自动复制原会话）：
+npm run desktop -- --isolated-profile "输入独立测试配置目录"
+```
+
+通过 Get-AppxPackage 动态发现桌面和该安装包 resources/codex.exe；若未发现，使用 `--app PATH_TO_EXE --codex PATH_TO_MATCHING_BACKEND_EXE`。不使用 npm SDK 附带的其他版本后端。支持 `--mode balanced|economy|quality` 和 `--model-cheap/--model-standard/--model-hard`。Jev 的密钥由启动终端继承的 `TYPESAFE_API_KEY` 提供，不要写入命令参数或日志。
+
+`--check` 不编译、不启动；`--prepare` 使用系统 .NET Framework csc 编译跟踪的 `src/desktop-shim.cs`。产物和仅含路由元数据的日志位于忽略的 `.router-memory/desktop/`。普通启动以及隔离启动均保守地拒绝已有桌面进程；check/prepare 可在桌面运行时使用。隔离 profile 仅隔离 Electron 配置，不保证隔离 CODEX_HOME 或后端登录数据。
+
+`npm run desktop` 会自动启动桌面应用，执行后等待窗口出现即可，无需再点击普通快捷方式。启动器打印 `launchedPid` 后退出并返回终端提示符；桌面应用及它启动的 stdio 中转进程继续运行，不需要让启动命令一直占用终端。在已返回提示符的终端按 Ctrl+C 不会关闭桌面中转。完全退出这次启动的桌面应用后中转才随之关闭；下次从普通快捷方式启动不会自动启用 Router。
+
+中转层在收到后端 `initialize` 成功响应后确认初始化完成，兼容桌面客户端不发送额外 `initialized` 通知的流程。
+
+shim 为单个 console exe：识别 `-c ... app-server` 和 `app-server ...` 的 stdio 启动形式，运行 Node + tsx 桌面入口；其他命令（含 exec-server、版本和协议生成命令）原样转发指定真实 exe。二进制流按块刷新，保留标准输入输出和退出码。后端环境移除 TypeSafe 密钥，并恢复 CODEX_CLI_PATH，防止递归。Windows Job Object 随 shim 退出清理它拥有的子进程；正常关闭有宽限期，强制清理也有截止时间，未确认后端退出时报告失败。不会按进程名称杀用户桌面。
+
+仅管理匹配 `--project` 的本地会话。thread/start 需要明确 cwd；resume/fork 没有 cwd 时，通过 thread/read 核对原会话目录，成功返回 threadId 后才接管。其他项目、无法确定目录的会话和远程会话保持透传；无需修改全局 MCP 配置。管理的会话添加禁止重复路由的指令及线程配置。每个新用户 turn/start 在同一个 threadId 上先分类，再覆盖 model、effort 和 collaborationMode.settings；保留 input 及其他参数。已确认活动轮的追加请求和 steer 透传；分类/启动确认阶段的 steer 明确拒绝。manual 保留原模型选择。权限请求、应答和通知由同一个 RPC 核心转发。路由取消、分类超时和后端确认超时不自动重发 turn。
+
+在打开的原版界面中进入指定项目，创建或恢复一个本地 Codex 会话，然后直接提问。自动模式每轮覆盖界面中手动选择的模型/强度；界面是否即时更新显示取决于后端通知，确认执行参数请查看下面的日志。退出实验启动的桌面，再使用原来的桌面快捷方式启动，即恢复普通入口。不要同时从 CLI 或其他客户端操作同一会话。
+
+桌面输入框使用 `composer` 标记新问题；中转层也识别 `user`、`composer_queue`、`composer_queue_run_now`、`page_composer`、`edit_user_message`、`chatgpt_handoff`。这些标记只对已接管的本地项目会话生效。自动化、系统重试、工具结果和活动轮追加消息继续透传，避免把同一任务的内部续执行当成新的用户问题。
+
+`.router-memory/desktop/routes-*.jsonl` 只记录路由元数据，不记录问题、回答或密钥。`proxy-started` 表示中转层启动；`backend-initialized` 表示收到后端初始化成功响应；`thread-managed` 表示该会话已接管；`route-selected` 是选择结果；`turn-accepted` 是后端接受请求；`turn-completed` 是执行状态。`thread-bypassed` 表示范围外会话。只看模型选择器或启动日志无法证明该轮经过路由；应按同一 threadId/turnId 对照这些事件及 Codex 的 `turn_context`。
+
+`turn-bypassed` 记录未重新选型的原因：`unmanaged-thread`（未接管的会话）、`active-turn`（活动轮追加）、`tool-output`（工具结果）、`non-user-trigger`（系统或未识别的提交类型）。不会记录原始问题或任意提交标记。
+
+```powershell
+npm run desktop -- --prepare
+npm run test:desktop
+npm run typecheck
+```
+
+验证记录（2026-10-11）：类型检查、原有 31 项测试、桌面专项与共享核心 23 项测试通过（共享测试重复计入两组）。覆盖环境隔离、JSON stdio、交互消息在 EOF 前及时转发、EOF 和有限清理、范围外会话透传、恢复会话目录核对、原生 shim 参数引用、退出码及 shim 意外退出后的子进程回收。已有桌面时拒绝启动的逻辑通过模拟进程启动测试确认。
+
+同日修复桌面恢复会话时错误等待 `initialized` 通知的问题：新增有/无该通知的恢复与路由测试，以及初始化未确认或失败时拒绝恢复的测试。桌面专项与共享核心现为 26 项通过，类型检查通过；修复后的真实桌面界面仍需重启验收。
+
+随后修复桌面 `composer` 新问题被误判为系统请求而直接透传的问题，补充用户提交、后台提交及活动轮续执行的回归测试；相关测试现为 29 项通过，类型检查通过。已运行的桌面中转需要重启才能加载此修改，真实桌面新一轮 Jev 选型仍需核对日志验收。
+
+使用安装版自带后端 `0.162.0-alpha.17.2`、按桌面实际参数启动 shim，完成了真实 Jev + Codex 两轮测试：第一轮 Luna/low，重连同一 thread 后第二轮 Sol/medium，并正确返回第一轮测试标记；后端 `turn_context` 确认两组执行参数。**这验证了 stdio 路径与后端上下文，不等于桌面输入框完整验收。** 本次没有关闭正在运行的用户桌面；原版 UI 输入、真实权限弹窗与完整桌面功能仍需通过此入口启动后确认。原应用包 `26.1007.2314.0` 已确认具备接入点；升级后应重新执行检查与验证。

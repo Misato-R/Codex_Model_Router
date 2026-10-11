@@ -4,8 +4,14 @@ import type { ModelInfo } from "./chat-session.js";
 // Deliberately transport independent: no terminal rendering and no synthetic model events.
 export type Message = { id?: string | number; method?: string; params?: Record<string, any>; result?: any; error?: any; [key: string]: any };
 type Id = string | number;
-type Pending = { original?: Id; method: string; params: Record<string, any>; resolve?: (value: any) => void; reject?: (error: Error) => void; timer?: NodeJS.Timeout };
+type Pending = { original?: Id; method: string; params: Record<string, any>; managed?: boolean; resolve?: (value: any) => void; reject?: (error: Error) => void; timer?: NodeJS.Timeout };
 type Turn = { phase: "routing" | "starting" | "active"; controller: AbortController; id?: string };
+// Native CLI and desktop use different labels for a new user submission.
+// Keep automation, retries and tool continuations on their existing settings.
+const USER_TURN_TRIGGERS = new Set([
+  "user", "composer", "composer_queue", "composer_queue_run_now",
+  "page_composer", "edit_user_message", "chatgpt_handoff",
+]);
 export const ROUTED_INSTRUCTIONS = "This thread is managed by the Jev CLI proxy. Routing has already been handled before each new user turn (or explicitly disabled in manual mode). Execute the task directly in this same thread. Do not call jev_route_and_run, invoke the router through shell commands, or delegate to a separate Codex SDK/CLI session. Preserve conversation context. This overrides repository instructions requesting rerouting.";
 
 export interface ProxyOptions {
@@ -13,6 +19,7 @@ export interface ProxyOptions {
   manual?: boolean;
   controlTimeoutMs?: number;
   classificationTimeoutMs?: number;
+  manageThread?(params: Record<string, any>): boolean;
   route(task: string, context: string, signal: AbortSignal): Promise<Route>;
   toBackend(message: Message): void;
   toClient(message: Message): void;
@@ -33,6 +40,7 @@ export class CliProxy {
   private initialized = false;
   private closed = false;
   private models: ModelInfo[] = [];
+  private managed = new Set<string>();
   private prepared?: Promise<void>;
 
   constructor(private readonly options: ProxyOptions) {}
@@ -72,21 +80,35 @@ export class CliProxy {
       this.error(message.id!, "Turn is not acknowledged yet; wait before steering."); return;
     }
     if (["thread/start", "thread/resume", "thread/fork"].includes(message.method!)) {
+      let scope = p;
+      if (this.options.manageThread && !p.cwd && p.threadId && !p.remote && !p.remoteUrl) {
+        const read = await this.internal("thread/read", { threadId: p.threadId, includeTurns: false });
+        scope = { ...p, cwd: read.thread?.cwd };
+      }
+      if (this.options.manageThread && !this.options.manageThread(scope)) { this.forward(message, false); return; }
       await this.prepare();
-      const config = await this.internal("config/read", { cwd: p.cwd ?? this.options.project, includeLayers: false });
+      const config = await this.internal("config/read", { cwd: scope.cwd ?? this.options.project, includeLayers: false });
       const existing = p.developerInstructions ?? p.config?.developer_instructions ?? config.config?.developer_instructions ?? "";
       this.forward({ ...message, params: { ...p,
         developerInstructions: [existing, ROUTED_INSTRUCTIONS].filter(Boolean).join("\n\n"),
         config: { ...p.config, "mcp_servers.jev_model_router.enabled": false },
-      } });
+      } }, true);
       return;
     }
     if (message.method !== "turn/start") { this.forward(message); return; }
+    if (this.options.manageThread && !this.managed.has(thread)) {
+      this.options.metadata?.({ event: "turn-bypassed", threadId: thread, reason: "unmanaged-thread" });
+      this.forward(message); return;
+    }
     if (this.submitted.has(message.id!)) { this.error(message.id!, "Repeated turn/start id; not retried."); return; }
     this.submitted.add(message.id!);
     if (active && active.phase !== "active") { this.error(message.id!, "Another turn submission is pending for this thread."); return; }
     // Native turn/start can append to an active turn. Preserve it just like turn/steer.
-    if (active || p.toolOutput || (p.turnTrigger && p.turnTrigger !== "user")) { this.forward(message); return; }
+    if (active || p.toolOutput || (p.turnTrigger && !USER_TURN_TRIGGERS.has(p.turnTrigger))) {
+      this.options.metadata?.({ event: "turn-bypassed", threadId: thread,
+        reason: active ? "active-turn" : p.toolOutput ? "tool-output" : "non-user-trigger" });
+      this.forward(message); return;
+    }
     const state: Turn = { phase: "routing", controller: new AbortController() };
     this.turns.set(thread, state);
     const task = (Array.isArray(p.input) ? p.input : []).filter((item: any) => item.type === "text").map((item: any) => item.text).join("\n");
@@ -162,10 +184,10 @@ export class CliProxy {
       this.options.toBackend({ id, method, params });
     });
   }
-  private forward(message: Message): void {
+  private forward(message: Message, managed?: boolean): void {
     if (this.closed) return;
     const id = ++this.sequence;
-    const pending: Pending = { original: message.id, method: message.method!, params: message.params ?? {} };
+    const pending: Pending = { original: message.id, method: message.method!, params: message.params ?? {}, managed };
     // This is only an acknowledgement deadline, never a reasoning deadline.
     if (message.method === "turn/start") pending.timer = setTimeout(() => {
       this.error(message.id!, "turn/start acknowledgement timed out; outcome unknown. Reconnect and inspect history; do not retry automatically.");
@@ -217,6 +239,13 @@ export class CliProxy {
       else pending.resolve!(message.result);
       return;
     }
+    // The installed desktop proceeds after the initialize response without an
+    // initialized notification. Observe the backend's acknowledgement before
+    // forwarding it, so a following resume can pass preflight in either client.
+    if (pending.method === "initialize" && !message.error && message.result != null) {
+      this.initialized = true;
+      this.options.metadata?.({ event: "backend-initialized" });
+    }
     if (pending.method === "turn/start") {
       const thread = pending.params.threadId;
       const state = this.turns.get(thread);
@@ -227,6 +256,11 @@ export class CliProxy {
         if (message.error || !turn || turn.status !== "inProgress" || this.completed.has(`${thread}:${turn.id}`)) this.turns.delete(thread);
         else { state.id = turn.id; state.phase = "active"; }
       }
+    }
+    if (["thread/start", "thread/resume", "thread/fork"].includes(pending.method) && !message.error && message.result?.thread?.id) {
+      const id = message.result.thread.id;
+      if (pending.managed) this.managed.add(id); else this.managed.delete(id);
+      this.options.metadata?.({ event: pending.managed ? "thread-managed" : "thread-bypassed", threadId: id });
     }
     if (["thread/resume", "thread/fork"].includes(pending.method)) {
       const thread = message.result?.thread;

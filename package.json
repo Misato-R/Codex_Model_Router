@@ -9,6 +9,8 @@
     "test": "tsx --test src/router.test.ts src/chat.test.ts src/cli-proxy.test.ts src/cli-host.test.ts",
     "typecheck": "tsc --noEmit",
     "cli": "tsx src/cli.ts",
+    "desktop": "tsx src/desktop.ts",
+    "test:desktop": "tsx --test src/desktop.test.ts src/cli-proxy.test.ts",
     "test:cli:core": "tsx --test src/cli-proxy.test.ts"
   },
   "dependencies": {
