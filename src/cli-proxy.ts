@@ -7,8 +7,10 @@ import type { ModelInfo } from "./chat-session.js";
 // Deliberately transport independent: no terminal rendering and no synthetic model events.
 export type Message = { id?: string | number; method?: string; params?: Record<string, any>; result?: any; error?: any; [key: string]: any };
 type Id = string | number;
-type Pending = { original?: Id; method: string; params: Record<string, any>; managed?: boolean; resolve?: (value: any) => void; reject?: (error: Error) => void; timer?: NodeJS.Timeout };
-type Turn = { phase: "routing" | "starting" | "active"; controller: AbortController; id?: string; timing?: TurnTiming; timingTurnId?: string; earlyCompletion?: { id: string; status: string; at: number }; earlyUsage?: Map<string, any> };
+type Pending = { original?: Id; method: string; params: Record<string, any>; managed?: boolean; turnOwner?: Turn; restoreVersion?: number; resolve?: (value: any) => void; reject?: (error: Error) => void; timer?: NodeJS.Timeout };
+type UsageSnapshot = { total?: unknown; last?: unknown };
+type BufferedTurn = { started?: boolean; completion?: { status: string; at: number }; usage?: UsageSnapshot };
+type Turn = { phase: "routing" | "starting" | "active"; controller: AbortController; id?: string; timing?: TurnTiming; beforeAck?: Map<string, BufferedTurn>; idleCheck?: Promise<void>; activityVersion?: number };
 // Native CLI and desktop use different labels for a new user submission.
 // Keep automation, retries and tool continuations on their existing settings.
 const USER_TURN_TRIGGERS = new Set([
@@ -49,6 +51,63 @@ export class CliProxy {
   private usageTotals = new Map<string, TokenCounts>();
   private timedTurns = new Map<string, TurnTiming>();
   private latestTimings = new Map<string, TurnTiming>();
+  private threadVersions = new Map<string, number>();
+
+  private setTurn(thread: string, state: Turn): void {
+    this.turns.set(thread, state);
+    this.threadVersions.set(thread, (this.threadVersions.get(thread) ?? 0) + 1);
+  }
+  private removeTurn(thread: string, state: Turn): void {
+    if (this.turns.get(thread) !== state) return;
+    this.turns.delete(thread);
+    this.threadVersions.set(thread, (this.threadVersions.get(thread) ?? 0) + 1);
+  }
+  private bufferTurn(state: Turn, turnId: string): BufferedTurn | undefined {
+    state.beforeAck ??= new Map();
+    const existing = state.beforeAck.get(turnId);
+    if (existing) return existing;
+    // Store only lifecycle/usage summaries; never queue streaming text or block forwarding.
+    if (state.beforeAck.size >= 128) { this.close(); this.options.fatal(); return; }
+    const buffered: BufferedTurn = {};
+    state.beforeAck.set(turnId, buffered);
+    return buffered;
+  }
+
+  private confirmIdle(thread: string, state: Turn): void {
+    if (state.id || state.idleCheck) return;
+    const activityVersion = state.activityVersion ?? 0;
+    // Recovery snapshots can report active without a turn ID. An arbitrary
+    // completion cannot prove ownership; query metadata, never start inference.
+    const check = this.internal("thread/read", { threadId: thread, includeTurns: false }).then(result => {
+      if (this.turns.get(thread) === state && (state.activityVersion ?? 0) === activityVersion &&
+          result.thread?.id === thread && result.thread?.status?.type === "idle") this.removeTurn(thread, state);
+    }).catch(() => {
+      if (!this.closed) this.options.metadata?.({ event: "thread-state-unconfirmed", threadId: thread });
+    }).finally(() => {
+      if (state.idleCheck === check) state.idleCheck = undefined;
+      if (this.turns.get(thread) === state && (state.activityVersion ?? 0) !== activityVersion) this.confirmIdle(thread, state);
+    });
+    state.idleCheck = check;
+  }
+
+  private updateUsage(thread: string, turnId: string, usage: UsageSnapshot): void {
+    if (!this.options.timing) return;
+    const state = this.turns.get(thread);
+    const total = tokenCounts(usage.total);
+    const recorded = this.timedTurns.get(`${thread}:${turnId}`);
+    if (recorded) recorded.usageUpdate(usage);
+    else if (state?.timing && state.id === turnId) state.timing.usageUpdate(usage);
+    else if (state?.phase === "starting") {
+      const buffered = this.bufferTurn(state, turnId);
+      if (buffered) buffered.usage = usage;
+    }
+    const latest = this.latestTimings.get(thread);
+    if (total && recorded?.isFinished && latest && latest !== recorded) latest.advanceUsageBaseline(total);
+    if (total && (!state || state.phase === "routing" || state.id === turnId)) {
+      const previous = this.usageTotals.get(thread);
+      if (!previous || total.totalTokens === null || previous.totalTokens === null || total.totalTokens >= previous.totalTokens) this.usageTotals.set(thread, total);
+    }
+  }
 
   private rememberTiming(thread: string, turnId: string, timing: TurnTiming): void {
     this.timedTurns.set(`${thread}:${turnId}`, timing);
@@ -82,10 +141,11 @@ export class CliProxy {
     const p = message.params ?? {};
     const thread = String(p.threadId ?? "");
     const active = this.turns.get(thread);
+    const restoreVersion = this.threadVersions.get(thread) ?? 0;
     if (message.method === "turn/interrupt" && active?.phase === "routing") {
       active.timing?.finish("cancelled-before-submit");
       active.controller.abort();
-      this.turns.delete(thread);
+      this.removeTurn(thread, active);
       this.reply(message.id!, {}); // Cancels only the proxy's not-yet-submitted work.
       return;
     }
@@ -98,14 +158,14 @@ export class CliProxy {
         const read = await this.internal("thread/read", { threadId: p.threadId, includeTurns: false });
         scope = { ...p, cwd: read.thread?.cwd };
       }
-      if (this.options.manageThread && !this.options.manageThread(scope)) { this.forward(message, false); return; }
+      if (this.options.manageThread && !this.options.manageThread(scope)) { this.forward(message, false, undefined, restoreVersion); return; }
       await this.prepare();
       const config = await this.internal("config/read", { cwd: scope.cwd ?? this.options.project, includeLayers: false });
       const existing = p.developerInstructions ?? p.config?.developer_instructions ?? config.config?.developer_instructions ?? "";
       this.forward({ ...message, params: { ...p,
         developerInstructions: [existing, ROUTED_INSTRUCTIONS].filter(Boolean).join("\n\n"),
         config: { ...p.config, "mcp_servers.jev_model_router.enabled": false },
-      } }, true);
+      } }, true, undefined, restoreVersion);
       return;
     }
     if (message.method !== "turn/start") { this.forward(message); return; }
@@ -123,7 +183,7 @@ export class CliProxy {
       this.forward(message); return;
     }
     const state: Turn = { phase: "routing", controller: new AbortController(), timing: this.options.timing ? new TurnTiming(thread, this.options.timing) : undefined };
-    this.turns.set(thread, state);
+    this.setTurn(thread, state);
     const task = (Array.isArray(p.input) ? p.input : []).filter((item: any) => item.type === "text").map((item: any) => item.text).join("\n");
     const signal = AbortSignal.any([state.controller.signal, AbortSignal.timeout(this.options.classificationTimeoutMs ?? 25_000)]);
     try {
@@ -150,11 +210,11 @@ export class CliProxy {
       state.timing?.submit(params.model, params.effort);
       if (state.timing) this.latestTimings.set(thread, state.timing);
       state.phase = "starting";
-      this.forward({ ...message, params });
+      this.forward({ ...message, params }, undefined, state);
       if (task) this.recent.set(thread, [...(this.recent.get(thread) ?? []), task.slice(0, 500)].slice(-3));
     } catch {
       state.timing?.finish(signal.aborted ? "cancelled-or-routing-timeout" : "routing-failed");
-      if (this.turns.get(thread) === state) this.turns.delete(thread);
+      this.removeTurn(thread, state);
       this.error(message.id!, signal.aborted ? "Turn cancelled or classification timed out; not submitted." : "Routing/preflight failed; turn not submitted. Check ChatGPT login, model mapping and Jev availability.");
     }
   }
@@ -202,10 +262,10 @@ export class CliProxy {
       this.options.toBackend({ id, method, params });
     });
   }
-  private forward(message: Message, managed?: boolean): void {
+  private forward(message: Message, managed?: boolean, turnOwner?: Turn, restoreVersion?: number): void {
     if (this.closed) return;
     const id = ++this.sequence;
-    const pending: Pending = { original: message.id, method: message.method!, params: message.params ?? {}, managed };
+    const pending: Pending = { original: message.id, method: message.method!, params: message.params ?? {}, managed, turnOwner, restoreVersion };
     // This is only an acknowledgement deadline, never a reasoning deadline.
     if (message.method === "turn/start") pending.timer = setTimeout(() => {
       this.error(message.id!, "turn/start acknowledgement timed out; outcome unknown. Reconnect and inspect history; do not retry automatically.");
@@ -227,46 +287,44 @@ export class CliProxy {
       const p = message.params ?? {};
       const state = this.turns.get(p.threadId);
       const turnId = p.turn?.id;
-      if (message.method === "thread/tokenUsage/updated" && this.options.timing && typeof p.turnId === "string" && p.tokenUsage) {
-        const total = tokenCounts(p.tokenUsage.total);
-        const knownId = state?.id ?? state?.timingTurnId;
-        const recorded = this.timedTurns.get(`${p.threadId}:${p.turnId}`);
-        if (recorded) recorded.usageUpdate(p.tokenUsage);
-        else if (state?.timing && knownId === p.turnId) state.timing.usageUpdate(p.tokenUsage);
-        else if (state?.timing && state.phase === "starting" && !knownId) {
-          state.earlyUsage ??= new Map();
-          state.earlyUsage.set(p.turnId, p.tokenUsage);
-          if (state.earlyUsage.size > 16) state.earlyUsage.delete(state.earlyUsage.keys().next().value!);
-        }
-        // A previous turn's final usage may be delivered after the next submission.
-        const latest = this.latestTimings.get(p.threadId);
-        if (total && recorded?.isFinished && latest && latest !== recorded) latest.advanceUsageBaseline(total);
-        // Only advance baselines for the current turn or idle-thread snapshots.
-        if (total && (!state || state.phase === "routing" || (knownId === p.turnId))) {
-          const previous = this.usageTotals.get(p.threadId);
-          if (!previous || total.totalTokens === null || previous.totalTokens === null || total.totalTokens >= previous.totalTokens) this.usageTotals.set(p.threadId, total);
-        }
+      if (message.method === "thread/tokenUsage/updated" && typeof p.turnId === "string" && p.tokenUsage) {
+        this.updateUsage(p.threadId, p.turnId, p.tokenUsage);
       }
       if (message.method === "thread/settings/updated" && p.threadSettings) {
         this.options.metadata?.({ event: "backend-settings", threadId: p.threadId,
           model: p.threadSettings.model, effort: p.threadSettings.effort });
       }
+      if (message.method === "thread/status/changed" && state?.phase === "active" && !state.id) {
+        if (p.status?.type === "idle") this.confirmIdle(p.threadId, state);
+        else if (p.status?.type === "active") state.activityVersion = (state.activityVersion ?? 0) + 1;
+      }
       if (message.method === "turn/completed" && turnId) {
         this.options.metadata?.({ event: "turn-completed", threadId: p.threadId, turnId, status: p.turn.status });
-        if (state && (state.id ?? state.timingTurnId) === turnId) state.timing?.finish(p.turn.status, turnId);
-        else if (state?.phase === "starting" && !state.id) state.earlyCompletion = { id: turnId, status: p.turn.status, at: performance.now() };
+        if (state?.phase === "starting") {
+          const buffered = this.bufferTurn(state, turnId);
+          if (buffered && !buffered.completion) buffered.completion = { status: p.turn.status, at: performance.now() };
+        } else if (state && state.id === turnId) {
+          state.timing?.finish(p.turn.status, turnId);
+          this.removeTurn(p.threadId, state);
+        } else if (state?.phase === "active" && !state.id) {
+          this.confirmIdle(p.threadId, state);
+        } else if (!state && !this.completed.has(`${p.threadId}:${turnId}`)) {
+          // Invalidates an older resume snapshot even when no local turn was loaded.
+          this.threadVersions.set(p.threadId, (this.threadVersions.get(p.threadId) ?? 0) + 1);
+        }
         this.completed.add(`${p.threadId}:${turnId}`);
         if (this.completed.size > 1024) this.completed.delete(this.completed.values().next().value!);
-        if (state?.id === turnId || (state?.phase === "active" && !state.id)) this.turns.delete(p.threadId);
       }
-      if (message.method === "turn/started" && turnId && state?.timing && state.phase === "starting" && !state.timingTurnId) {
-        state.timingTurnId = turnId;
-        this.rememberTiming(p.threadId, turnId, state.timing);
-        const usage = state.earlyUsage?.get(turnId);
-        if (usage) { state.timing.usageUpdate(usage); const total = tokenCounts(usage.total); if (total) this.usageTotals.set(p.threadId, total); }
-      }
-      if (message.method === "turn/started" && turnId && !state && !this.completed.has(`${p.threadId}:${turnId}`)) {
-        this.turns.set(p.threadId, { phase: "active", id: turnId, controller: new AbortController() });
+      if (message.method === "turn/started" && turnId) {
+        if (state?.phase === "starting") {
+          const buffered = this.bufferTurn(state, turnId);
+          if (buffered) buffered.started = true;
+        } else if (!state && !this.completed.has(`${p.threadId}:${turnId}`)) {
+          this.setTurn(p.threadId, { phase: "active", id: turnId, controller: new AbortController() });
+        } else if (state?.phase === "active" && !state.id && !this.completed.has(`${p.threadId}:${turnId}`)) {
+          // Invalidate an in-flight idle snapshot without claiming an unowned ID.
+          state.activityVersion = (state.activityVersion ?? 0) + 1;
+        }
       }
       if (message.method === "serverRequest/resolved") {
         const id = this.serverReverse.get(p.requestId);
@@ -297,18 +355,26 @@ export class CliProxy {
       const state = this.turns.get(thread);
       this.options.metadata?.({ event: message.error ? "turn-rejected" : "turn-accepted", threadId: thread,
         turnId: message.result?.turn?.id, model: pending.params.model, effort: pending.params.effort });
-      if (state?.phase === "starting") {
+      // Pass-through appends never own a routed submission. A delayed reply may
+      // update only the exact state object that originated its request.
+      if (pending.turnOwner && state === pending.turnOwner && state.phase === "starting") {
         const turn = message.result?.turn;
-        if (turn && state.timing) {
-          this.rememberTiming(thread, turn.id, state.timing);
-          const usage = state.earlyUsage?.get(turn.id);
-          if (usage) { state.timing.usageUpdate(usage); const total = tokenCounts(usage.total); if (total) this.usageTotals.set(thread, total); }
+        if (message.error || !turn || typeof turn.id !== "string" || !turn.id) {
+          state.timing?.finish("submission-rejected");
+          this.removeTurn(thread, state);
+        } else {
+          state.id = turn.id;
+          state.phase = "active";
+          if (state.timing) this.rememberTiming(thread, turn.id, state.timing);
+          const buffered = state.beforeAck?.get(turn.id);
+          state.beforeAck?.clear();
+          if (buffered?.usage) this.updateUsage(thread, turn.id, buffered.usage);
+          const terminal = buffered?.completion;
+          if (terminal || turn.status !== "inProgress" || this.completed.has(`${thread}:${turn.id}`)) {
+            state.timing?.finish(terminal?.status ?? turn.status, turn.id, terminal?.at);
+            this.removeTurn(thread, state);
+          }
         }
-        if (message.error || !turn) state.timing?.finish("submission-rejected");
-        else if (state.earlyCompletion && state.earlyCompletion.id === turn.id) state.timing?.finish(state.earlyCompletion.status, turn.id, state.earlyCompletion.at);
-        else if (turn.status !== "inProgress") state.timing?.finish(turn.status, turn.id);
-        if (message.error || !turn || turn.status !== "inProgress" || this.completed.has(`${thread}:${turn.id}`)) this.turns.delete(thread);
-        else { state.id = turn.id; state.phase = "active"; }
       }
     }
     if (["thread/start", "thread/resume", "thread/fork"].includes(pending.method) && !message.error && message.result?.thread?.id) {
@@ -320,7 +386,11 @@ export class CliProxy {
     if (["thread/resume", "thread/fork"].includes(pending.method)) {
       const thread = message.result?.thread;
       const turn = thread?.turns?.findLast((item: any) => item.status === "inProgress");
-      if (thread && (turn || thread.status?.type === "active")) this.turns.set(thread.id, { phase: "active", id: turn?.id, controller: new AbortController() });
+      const expectedVersion = pending.params.threadId === thread?.id ? pending.restoreVersion : 0;
+      if (thread && !this.turns.has(thread.id) && (this.threadVersions.get(thread.id) ?? 0) === expectedVersion &&
+          (turn || thread.status?.type === "active") && (!turn || !this.completed.has(`${thread.id}:${turn.id}`))) {
+        this.setTurn(thread.id, { phase: "active", id: turn?.id, controller: new AbortController() });
+      }
     }
     this.clientIds.delete(pending.original);
     this.options.toClient({ ...message, id: pending.original });
@@ -334,6 +404,6 @@ export class CliProxy {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject?.(new Error("Disconnected")); }
     this.pending.clear(); this.turns.clear(); this.recent.clear(); this.serverIds.clear(); this.serverReverse.clear();
     this.usageTotals.clear(); this.timedTurns.clear();
-    this.latestTimings.clear();
+    this.latestTimings.clear(); this.threadVersions.clear();
   }
 }

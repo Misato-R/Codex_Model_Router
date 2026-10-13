@@ -56,10 +56,10 @@ test("timing records routing failure without inventing Codex execution", async (
   assert.equal(records[0].durationsMs.codex, null);
 });
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
-function usage(h: ReturnType<typeof harness>, id: string, total: number) {
+function usage(h: ReturnType<typeof harness>, id: string, total: number, threadId = "same") {
   const counts = { totalTokens: total, inputTokens: total * 0.8, cachedInputTokens: total * 0.2,
     outputTokens: total * 0.2, reasoningOutputTokens: total * 0.1 };
-  h.proxy.backend({ method: "thread/tokenUsage/updated", params: { threadId: "same", turnId: id,
+  h.proxy.backend({ method: "thread/tokenUsage/updated", params: { threadId, turnId: id,
     tokenUsage: { total: counts, last: { ...counts, totalTokens: 10 }, modelContextWindow: null } } });
 }
 
@@ -105,7 +105,9 @@ test("usage arriving before turn/start acknowledgement is attributed by returned
   usage(h, "previous", 100); h.start(); await tick(); usage(h, "early", 180); h.complete("early"); h.ack(0, "early");
   assert.equal(records.at(-1).tokenUsage.counts.totalTokens, 80); h.proxy.close();
 });
-function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {}) {
+function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {}, models = [
+  { model: "available", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+]) {
   const backend: Message[] = [], client: Message[] = [], metadata: Record<string, unknown>[] = [];
   const classifications: { task: string; context: string; signal: AbortSignal }[] = [];
   let fatal = false;
@@ -114,7 +116,7 @@ function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {
     toBackend(message) {
       backend.push(message);
       const result = message.method === "account/read" ? { account: { type: "chatgpt" } }
-        : message.method === "model/list" ? { data: [{ model: "available", supportedReasoningEfforts: [{ reasoningEffort: "low" }] }], nextCursor: null }
+        : message.method === "model/list" ? { data: models, nextCursor: null }
         : message.method === "config/read" ? { config: { developer_instructions: "global instruction" } } : undefined;
       if (result) queueMicrotask(() => proxy.backend({ id: message.id, result }));
     },
@@ -125,7 +127,7 @@ function harness(options: Partial<ConstructorParameters<typeof CliProxy>[0]> = {
     start(id: number | string = 1, extra: object = {}) { proxy.client({ id, method: "turn/start", params: { threadId: "same", input: [{ type: "text", text: "question" }], ...extra } }); },
     submitted() { return backend.filter((m) => m.method === "turn/start"); },
     ack(index = 0, turnId = "turn") { const sent = backend.filter((m) => m.method === "turn/start")[index]; proxy.backend({ id: sent.id, result: { turn: { id: turnId, status: "inProgress" } } }); },
-    complete(turnId = "turn") { proxy.backend({ method: "turn/completed", params: { threadId: "same", turn: { id: turnId, status: "completed" } } }); },
+    complete(turnId = "turn", threadId = "same") { proxy.backend({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } }); },
   };
 }
 
@@ -153,6 +155,228 @@ test("early completion before ack and stale events do not keep the next turn act
   assert.equal(h.classifications.length, 2);
   assert.equal(h.submitted()[2].params?.model, "unchanged");
   h.proxy.backend({ id: h.submitted()[2].id, result: { turn: { id: "new", status: "inProgress" } } });
+});
+
+test("an old append acknowledgement cannot clear a newer routed submission in the same thread", async (t) => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record) }); t.after(() => h.proxy.close());
+  usage(h, "history", 100);
+  h.start(1); await tick(); h.ack(0, "old"); usage(h, "old", 140);
+  h.start(2, { model: "append-keeps-native", effort: "high" }); await tick();
+  assert.equal(h.classifications.length, 1);
+  h.complete("old");
+  h.start(3); await tick();
+  assert.equal(h.classifications.length, 2);
+  assert.equal(h.submitted().length, 3);
+
+  // The response to the append belongs to the completed old turn, even though
+  // another request is now waiting for its turn/start acknowledgement.
+  h.ack(1, "old");
+  assert.equal(records.length, 1);
+  h.start(4); await tick();
+  assert.equal(h.classifications.length, 2);
+  assert.equal(h.submitted().length, 3);
+  assert.ok(h.client.find(message => message.id === 4)?.error);
+  h.ack(2, "new"); usage(h, "new", 200); h.complete("new");
+  assert.equal(records.length, 2);
+  assert.equal(records.at(-1).turnId, "new");
+  assert.equal(records.at(-1).tokenUsage.counts.totalTokens, 60);
+});
+
+test("stale notifications cannot claim unacknowledged timing and early completion survives unrelated events", async (t) => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record) }); t.after(() => h.proxy.close());
+  usage(h, "history", 100);
+  h.start(1); await tick(); h.ack(0, "old"); usage(h, "old", 140); h.complete("old");
+  const oldRequestId = records.at(-1).requestId;
+  h.start(2); await tick();
+  h.proxy.backend({ method: "turn/started", params: { threadId: "same", turn: { id: "old" } } });
+  usage(h, "old", 160); h.complete("old");
+  assert.ok(records.every(record => record.requestId === oldRequestId));
+
+  h.proxy.backend({ method: "turn/started", params: { threadId: "same", turn: { id: "new" } } });
+  usage(h, "new", 220); h.complete("new");
+  // A second unrelated completion must not replace the new turn's buffered
+  // completion, and all timing remains unclaimed until the response arrives.
+  h.complete("old");
+  assert.ok(records.every(record => record.requestId === oldRequestId));
+  h.ack(1, "new");
+  const current = records.filter(record => record.requestId !== oldRequestId);
+  assert.equal(current.length, 1);
+  assert.equal(current[0].turnId, "new");
+  assert.equal(current[0].status, "completed");
+  assert.equal(current[0].tokenUsage.counts.totalTokens, 60);
+  assert.ok(current[0].durationsMs.codex >= 0);
+  h.start(3); await tick();
+  assert.equal(h.classifications.length, 3);
+  h.ack(2, "next"); h.complete("next");
+});
+
+test("late resume responses cannot replace a routed request while classification or acknowledgement is pending", async (t) => {
+  for (const phase of ["routing", "starting"] as const) await t.test(phase, async (subtest) => {
+    const gate = deferred<Route>(); const records: any[] = [];
+    const h = harness({ route: () => gate.promise, timing: record => records.push(record) });
+    subtest.after(() => h.proxy.close());
+    usage(h, "history", 100);
+    h.proxy.client({ id: "resume", method: "thread/resume", params: { threadId: "same" } });
+    await tick();
+    const resume = h.backend.find(message => message.method === "thread/resume")!;
+    assert.ok(resume);
+    h.start(1); await tick();
+    if (phase === "starting") { gate.resolve(route); await tick(); }
+    h.proxy.backend({ id: resume.id, result: { thread: { id: "same", status: { type: "active" },
+      turns: [{ id: "previous", status: "inProgress" }] } } });
+    if (phase === "routing") { gate.resolve(route); await tick(); }
+    assert.equal(h.submitted().length, 1);
+    h.ack(0, "current"); usage(h, "current", 180); h.complete("current");
+    assert.equal(records.length, 1);
+    assert.equal(records[0].turnId, "current");
+    assert.equal(records[0].tokenUsage.counts.totalTokens, 80);
+    h.start(2); await tick();
+    assert.equal(h.submitted().length, 2);
+    assert.equal(h.submitted()[1].params?.model, "available");
+    assert.ok(h.metadata.filter(entry => entry.event === "route-selected").length === 2);
+    h.ack(1, "next"); h.complete("next");
+  });
+});
+
+test("an opaque restored active turn releases only after a read-only thread lookup confirms idle", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  h.proxy.client({ id: "resume", method: "thread/resume", params: { threadId: "same" } });
+  await tick();
+  const resume = h.backend.find(message => message.method === "thread/resume")!;
+  h.proxy.backend({ id: resume.id, result: { thread: { id: "same", status: { type: "active" }, turns: [] } } });
+  h.complete("restored-turn"); await tick();
+  const reads = h.backend.filter(message => message.method === "thread/read");
+  assert.equal(reads.length, 1);
+  assert.deepEqual(reads[0].params, { threadId: "same", includeTurns: false });
+  assert.equal(h.classifications.length, 0);
+  assert.equal(h.submitted().length, 0);
+  h.proxy.backend({ id: reads[0].id, result: { thread: { id: "same", status: { type: "idle" } } } });
+  await tick();
+  h.start(1, { model: "native" }); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.equal(h.submitted()[0].params?.model, "available");
+  h.ack(0, "new"); h.complete("new");
+});
+
+test("an idle notification waits for confirmation and duplicate old lookup results cannot release a newer routed submission", async (t) => {
+  const records: any[] = [];
+  const h = harness({ timing: record => records.push(record) }); t.after(() => h.proxy.close());
+  usage(h, "history", 100);
+  h.proxy.client({ id: "resume", method: "thread/resume", params: { threadId: "same" } });
+  await tick();
+  const resume = h.backend.find(message => message.method === "thread/resume")!;
+  h.proxy.backend({ id: resume.id, result: { thread: { id: "same", status: { type: "active" }, turns: [] } } });
+  h.complete("restored-turn"); await tick();
+  const read = h.backend.find(message => message.method === "thread/read");
+  assert.ok(read);
+  assert.deepEqual(read.params, { threadId: "same", includeTurns: false });
+
+  // An unowned idle notification cannot release the unknown state while its
+  // metadata query is pending; native appends must continue to bypass routing.
+  h.proxy.backend({ method: "thread/status/changed", params: { threadId: "same", status: { type: "idle" } } });
+  h.start(1, { model: "native" }); await tick();
+  assert.equal(h.classifications.length, 0);
+  assert.equal(h.submitted()[0].params?.model, "native");
+  h.ack(0, "restored-turn");
+  h.proxy.backend({ id: read.id, result: { thread: { id: "same", status: { type: "idle" } } } });
+  await tick();
+  h.start(2); await tick();
+  assert.equal(h.classifications.length, 1);
+  // Responses are also request-bound: a duplicate result from the completed
+  // lookup must not remove the newly created starting state.
+  h.proxy.backend({ id: read.id, result: { thread: { id: "same", status: { type: "idle" } } } });
+  await tick();
+  h.start(3); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.equal(h.submitted().length, 2);
+  assert.ok(h.client.find(message => message.id === 3)?.error);
+  assert.equal(records.length, 0);
+  h.ack(1, "current"); usage(h, "current", 180); h.complete("current");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].turnId, "current");
+  assert.equal(records[0].tokenUsage.counts.totalTokens, 80);
+  h.start(4); await tick();
+  assert.equal(h.classifications.length, 2);
+  h.ack(2, "next"); h.complete("next");
+});
+
+test("new activity invalidates an opaque turn's idle snapshot until a current lookup confirms completion", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  h.proxy.client({ id: "resume", method: "thread/resume", params: { threadId: "same" } });
+  await tick();
+  const resume = h.backend.find(message => message.method === "thread/resume")!;
+  h.proxy.backend({ id: resume.id, result: { thread: { id: "same", status: { type: "active" }, turns: [] } } });
+  h.proxy.backend({ method: "thread/status/changed", params: { threadId: "same", status: { type: "idle" } } });
+  await tick();
+  const initial = h.backend.find(message => message.method === "thread/read")!;
+  assert.ok(initial);
+  assert.deepEqual(initial.params, { threadId: "same", includeTurns: false });
+  h.proxy.backend({ method: "turn/started", params: { threadId: "same", turn: { id: "live" } } });
+  h.proxy.backend({ id: initial.id, result: { thread: { id: "same", status: { type: "idle" } } } });
+  await tick();
+  const refreshed = h.backend.filter(message => message.method === "thread/read");
+  assert.equal(refreshed.length, 2);
+  assert.deepEqual(refreshed[1].params, { threadId: "same", includeTurns: false });
+  h.start(1, { model: "native", effort: "high" }); await tick();
+  assert.equal(h.classifications.length, 0);
+  assert.equal(h.submitted()[0].params?.model, "native");
+  h.ack(0, "live");
+
+  h.proxy.backend({ id: refreshed[1].id, result: { thread: { id: "same", status: { type: "active" } } } });
+  await tick();
+  h.start(2, { model: "still-native" }); await tick();
+  assert.equal(h.classifications.length, 0);
+  assert.equal(h.submitted()[1].params?.model, "still-native");
+  h.ack(1, "live");
+  h.complete("live"); await tick();
+  const finalReads = h.backend.filter(message => message.method === "thread/read");
+  assert.equal(finalReads.length, 3);
+  h.proxy.backend({ id: finalReads[2].id, result: { thread: { id: "same", status: { type: "idle" } } } });
+  await tick();
+  h.start(3, { model: "native" }); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.equal(h.submitted()[2].params?.model, "available");
+  h.ack(2, "new"); h.complete("new");
+});
+
+test("completion received before an opaque active resume response prevents restoration of the obsolete state", async (t) => {
+  const h = harness(); t.after(() => h.proxy.close());
+  h.proxy.client({ id: "resume", method: "thread/resume", params: { threadId: "same" } });
+  await tick();
+  const resume = h.backend.find(message => message.method === "thread/resume")!;
+  h.complete("previous");
+  h.proxy.backend({ id: resume.id, result: { thread: { id: "same", status: { type: "active" }, turns: [] } } });
+  h.start(1, { model: "native" }); await tick();
+  assert.equal(h.classifications.length, 1);
+  assert.equal(h.submitted()[0].params?.model, "available");
+  assert.equal(h.backend.filter(message => message.method === "thread/read").length, 0);
+  h.ack(0, "current"); h.complete("current");
+});
+
+test("two threads keep route parameters and token deltas isolated when classification and responses arrive in reverse order", async (t) => {
+  const first = deferred<Route>(), second = deferred<Route>(); const records: any[] = [];
+  const h = harness({ route: task => task === "first-task" ? first.promise : second.promise,
+    timing: record => records.push(record) }, [
+    { model: "available", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+    { model: "powerful", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+  ]); t.after(() => h.proxy.close());
+  usage(h, "history-a", 100, "a"); usage(h, "history-b", 1000, "b");
+  h.start(1, { threadId: "a", input: [{ type: "text", text: "first-task" }] });
+  h.start(2, { threadId: "b", input: [{ type: "text", text: "second-task" }] });
+  await tick();
+  second.resolve({ ...route, model: "powerful", effort: "high", tier: "hard" }); await tick();
+  first.resolve(route); await tick();
+  assert.deepEqual(h.submitted().map(message => [message.params?.threadId, message.params?.model, message.params?.effort]),
+    [["b", "powerful", "high"], ["a", "available", "low"]]);
+  h.ack(1, "turn-a"); h.ack(0, "turn-b");
+  usage(h, "turn-b", 1080, "b"); usage(h, "turn-a", 150, "a");
+  h.complete("turn-b", "b"); h.complete("turn-a", "a");
+  assert.equal(records.length, 2);
+  assert.deepEqual(records.map(record => [record.threadId, record.turnId, record.model, record.effort,
+    record.tokenUsage.counts.totalTokens]),
+    [["b", "turn-b", "powerful", "high", 80], ["a", "turn-a", "available", "low", 50]]);
 });
 
 test("native collaboration mask uses routed settings without losing Plan instructions", async (t) => {
